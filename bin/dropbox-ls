@@ -1,0 +1,111 @@
+#!/usr/bin/env ruby
+
+require 'dropbox_api'
+require 'json'
+require 'pry'
+
+def with_retry
+  while true
+    begin
+      return yield
+    rescue DropboxApi::Errors::TooManyRequestsError => e
+      $stderr.puts e.inspect
+      sleep e.retry_after
+    end
+  end
+end
+
+def list_folder(dropbox_client, *args)
+  r = with_retry { dropbox_client.list_folder(*args) }
+  all_entries = []
+
+  while true
+    if block_given?
+      r.entries.each {|e| yield e }
+    else
+      all_entries.concat r.entries
+    end
+
+    break unless r.has_more?
+
+    r = with_retry { dropbox_client.list_folder_continue(r.cursor) }
+  end
+  
+  all_entries
+end
+
+auth_file = nil
+recursive = false
+json_format = false
+verbose = false
+
+require 'optparse'
+opts_parser = OptionParser.new do |opts|
+  opts.banner = "
+dropbox-ls [OPTIONS] [PATH]
+  "
+
+  opts.separator "Authentication:"
+  opts.on("-a", "--authentication-file=s", "Specify the path to the access token JSON file") do |v|
+    auth_file = v
+  end
+  opts.separator ""
+  opts.separator "Controlling what is listed:"
+  opts.on("-r", "--recursive", "Recurse down folders") do
+    recursive = true
+  end
+  opts.separator ""
+  opts.separator "Controlling what is output:"
+  opts.on("-j", "--json", "Output as JSON") do
+    json_format = true
+  end
+  opts.on("-v", "--verbose", "Show revisions, hashes etc") do
+    verbose = true
+  end
+  opts.separator '
+--authentication-file MUST be specified.  It should name a JSON file; the
+file will be read and the "access_token" within will be used.
+
+For example:
+  { "access_token" : "..." }
+
+'
+end
+
+opts_parser.parse!
+
+if auth_file.nil?
+  $stderr.puts "No --authentication-file specified"
+  exit 2
+end
+
+starting_path = ARGV.first || ""
+access_token = JSON.parse(IO.read auth_file)["access_token"]
+dropbox = DropboxApi::Client.new(access_token)
+
+list_folder(dropbox, starting_path, recursive: recursive) do |entry|
+  if json_format
+    puts JSON.generate(entry.to_hash)
+  elsif verbose
+    # .name, .client_modified, .server_modified, .rev, .size, .content_hash
+    puts sprintf("%-6<type>s  %<id>s  %13<rev>s  %64<content_hash>s  %12<size>s  %20<server_modified>s  %<name>s", {
+      type: entry.to_hash[".tag"],
+      id: entry.id,
+      rev: begin ; entry.rev ; rescue NoMethodError ; "" ; end,
+      content_hash: begin ; entry.content_hash ; rescue NoMethodError ; "" ; end,
+      size: begin ; entry.size.to_s ; rescue NoMethodError ; "" ; end,
+      server_modified: begin ; entry.server_modified.utc.strftime('%Y-%m-%dT%H:%M:%SZ') ; rescue NoMethodError ; "" ; end,
+      name: entry.path_display,
+    })
+  else
+    # .name, .client_modified, .server_modified, .rev, .size, .content_hash
+    puts sprintf("%-6<type>s  %12<size>s  %20<server_modified>s  %<name>s", {
+      type: entry.to_hash[".tag"],
+      size: begin ; entry.size.to_s ; rescue NoMethodError ; "" ; end,
+      server_modified: begin ; entry.server_modified.utc.strftime('%Y-%m-%dT%H:%M:%SZ') ; rescue NoMethodError ; "" ; end,
+      name: entry.path_display,
+    })
+  end
+end
+
+# eof dropbox-ls
